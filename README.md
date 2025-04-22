@@ -2,7 +2,7 @@
 
 Implementation of LLaMA in PyTorch. Supports Multi-Head Self-Attention (MHSA), Multi-Query Attention (MQA), Grouped Query Attention (GQA), and (dynamic, NTK-aware)-Rotary/Standard Positional Embeddings.
 
-> All docstrinsg were written by Grok-3, for your convenience (and my time).
+> All docstrings were written by Grok-3, for your convenience (and my time).
 
 ## Sample Usage
 
