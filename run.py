@@ -1,21 +1,25 @@
 import torch
 from llama.model import LLaMA
 
-seq_len = 10
-
-context_len = 20
+batch_size = 16
+seq_len = 512
+context_len = 512
 d_model = 256
 n_heads = 8
 n_blocks = 4
 vocab_size = 10000
 pos_emb_dropout_p = 0.1
-pos_emb_type = "rope"
+pos_emb_type = "pe"
 learned = False
 ntk_rope_scaling = False
 dyn_scaling = False
-attn_type = "gqa"
+attn_type = "mva" # mhsa, mqa, gqa, mva, tksva (slow and memory intensive, as I haven't written a kernel for it yet)
+top_k_sparsev = 128
+p_threshold = 0.1
+p_threshold_steps_fraction = 0.6
 n_groups = 4
 supress_warnings = True
+_inference = True
 
 model = LLaMA(
     context_len = context_len,
@@ -30,9 +34,23 @@ model = LLaMA(
     dyn_scaling = dyn_scaling,
     attn_type = attn_type,
     n_groups = n_groups,
+    top_k_sparsev = top_k_sparsev,
+    p_threshold = p_threshold,
+    p_threshold_steps_fraction = p_threshold_steps_fraction,
     supress_warnings = supress_warnings
     )
 
-x = torch.randint(low = 0, high = vocab_size, size = (2, seq_len))
 
-print(model(x).shape) # 2, 10, 10000
+# Forward Pass
+
+x = torch.randint(low = 0, high = vocab_size, size = (batch_size, seq_len))
+print(f'FORWARD ----------')
+print(model(x).shape, '\n')
+
+# Inference
+x1 = torch.randint(low = 0, high = vocab_size, size = (batch_size, seq_len))
+x2 = torch.randint(low = 0, high = vocab_size, size = (batch_size, 1))
+
+print(f'INFERENCE ----------')
+print(model(x1, _inference = _inference).shape)
+print(model(x2, _inference = _inference).shape)

@@ -1,6 +1,8 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from typing import Union
 
 class TransformerBlock(nn.Module):
@@ -27,8 +29,14 @@ class TransformerBlock(nn.Module):
         ntk_rope_scaling: Union[dict, bool], 
         dyn_scaling: Union[bool, float], 
         attn_type: str = "gqa",
-        n_groups: int = None
-    ):
+        n_groups: int = None,
+        top_k_sparsev:int = None,
+        p_threshold:int = None,
+        p_threshold_steps_fraction:float = None,
+        flash_attn: bool = False,
+        flash_attn_dtype:torch.dtype = torch.float16
+        ):
+        
         """
         Initializes the TransformerBlock.
 
@@ -39,10 +47,14 @@ class TransformerBlock(nn.Module):
             ntk_rope_scaling (Union[dict, bool]): If dict, contains 'pretrained_context_window' and 'new_context_window'
                 for NTK RoPE scaling; if False, no scaling is applied.
             dyn_scaling (Union[bool, float]): If float between 0 and 1, applies dynamic scaling to RoPE; if False, no scaling.
-            attn_type (str, optional): Attention mechanism type ('mhsa', 'mqa', 'gqa'). Defaults to 'gqa'.
+            attn_type (str, optional): Attention mechanism type ('mhsa', 'mqa', 'gqa', 'mva'). Defaults to 'gqa'.
             n_groups (int, optional): Number of groups for grouped query attention. Required if attn_type is 'gqa'.
+            flash_attn (bool, optional): If True, uses FlashAttention for faster computation. Defaults to False.
+            flash_attn_dtype (torch.dtype, optional): Data type for FlashAttention. Defaults to torch.float16.
         """
+        
         super().__init__()
+        
         self.d_model = d_model
         self.n_heads = n_heads 
         self.d_head = d_model // n_heads
@@ -51,13 +63,18 @@ class TransformerBlock(nn.Module):
         self.dyn_scaling = dyn_scaling 
         self.attn_type = attn_type
         self.n_groups = n_groups
-       
+        self.top_k_sparsev = top_k_sparsev
+        self.flash_attn = flash_attn
+        self.flash_attn_dtype = flash_attn_dtype
+        self.p_threshold = p_threshold
+        self.p_threshold_steps_fraction = p_threshold_steps_fraction
+      
         self.rmsnorm1 = nn.RMSNorm(normalized_shape=d_model) 
         self.linearQ = nn.Linear(d_model, d_model)
         self.linearK, self.linearV = self._get_attn_projs()
         self.attention = self._get_attention()
         self.rmsnorm2 = nn.RMSNorm(normalized_shape=d_model)
-        self.swigluNN = FeedForwardSwiGLU(d_model=d_model) 
+        self.swigluNN = FeedForwardSwiGLU(d_model=d_model, h_dim = int((2/3) * 4 * d_model))
         
     def forward(self, x, _inference=False):
         """
@@ -72,6 +89,7 @@ class TransformerBlock(nn.Module):
         """
         x_res = x 
         x = self.rmsnorm1(x)
+        
         q = self.linearQ(x)  
         k = self.linearK(x)
         v = self.linearV(x)
@@ -85,14 +103,16 @@ class TransformerBlock(nn.Module):
             assert v.shape[1] == 1, f"Expected v sequence length of 1 once KV cache exists, got {v.shape[1]}"
             self.k_cache = torch.cat([self.k_cache, k], dim=1)
             self.v_cache = torch.cat([self.v_cache, v], dim=1) 
-            assert self.k_cache.shape == self.v_cache.shape, f"Expected k_cache and v_cache to match, got {self.k_cache.shape}, {self.v_cache.shape}" 
+            if self.attn_type not in ['mva', 'tksva']:
+                assert self.k_cache.shape == self.v_cache.shape, f"Expected k_cache and v_cache to match, got {self.k_cache.shape}, {self.v_cache.shape}" 
             if self.k_cache.shape[1] > self.context_len:
                 self.k_cache = self.k_cache[:, -self.context_len:, :]
                 self.v_cache = self.v_cache[:, -self.context_len:, :] 
             k = self.k_cache
             v = self.v_cache
-  
+
         x = self.attention(q, k, v, _inference=_inference) + x_res
+        
         x = self.rmsnorm2(x) 
         x = self.swigluNN(x) + x 
         return x
@@ -108,23 +128,30 @@ class TransformerBlock(nn.Module):
             AssertionError: If attn_type is not 'mhsa', 'mqa', or 'gqa'.
             ValueError: If n_groups is None when attn_type is 'gqa'.
         """
-        assert self.attn_type in ['mhsa', 'mqa', 'gqa'], f"Invalid attention type: {self.attn_type}. Choose from ['mhsa', 'mqa', 'gqa']"
+        assert self.attn_type in ['mhsa', 'mqa', 'gqa', 'mva', 'tksva'], f"Invalid attention type: {self.attn_type}. Choose from 'mhsa', 'mqa', 'gqa', 'mva', 'tksva'"
+
         if self.attn_type == 'mhsa':
             return MultiHeadSelfAttention(
                 n_heads=self.n_heads,
                 d_model=self.d_model,
                 context_len=self.context_len,
                 ntk_rope_scaling=self.ntk_rope_scaling,
-                dyn_scaling=self.dyn_scaling
+                dyn_scaling=self.dyn_scaling,
+                flash_attn = self.flash_attn,
+                flash_attn_dtype = self.flash_attn_dtype
             )  
+
         elif self.attn_type == 'mqa':
             return MultiQueryAttention(
                 n_heads=self.n_heads,
                 d_model=self.d_model,
                 context_len=self.context_len,
                 ntk_rope_scaling=self.ntk_rope_scaling,
-                dyn_scaling=self.dyn_scaling
+                dyn_scaling=self.dyn_scaling,
+                flash_attn = self.flash_attn,
+                flash_attn_dtype = self.flash_attn_dtype
             )
+
         elif self.attn_type == 'gqa':
             if self.n_groups is None:
                 raise ValueError("n_groups must be specified for Grouped Query Attention") 
@@ -134,7 +161,28 @@ class TransformerBlock(nn.Module):
                 d_model=self.d_model,
                 context_len=self.context_len,
                 ntk_rope_scaling=self.ntk_rope_scaling,
-                dyn_scaling=self.dyn_scaling
+                dyn_scaling=self.dyn_scaling,
+                flash_attn = self.flash_attn,
+                flash_attn_dtype = self.flash_attn_dtype
+            )
+
+        elif self.attn_type == 'mva':
+            return MultiValueAttention(
+                n_heads = self.n_heads,
+                d_model = self.d_model,
+                context_len = self.context_len,
+                ntk_rope_scaling = self.ntk_rope_scaling,
+                dyn_scaling = self.dyn_scaling,
+            )
+
+        elif self.attn_type == 'tksva':
+            return TopKSparseVAttention(
+                n_heads = self.n_heads,
+                d_model = self.d_model,
+                top_k_sparsev = self.top_k_sparsev,
+                context_len = self.context_len,
+                ntk_rope_scaling = self.ntk_rope_scaling,
+                dyn_scaling = self.dyn_scaling, 
             )
 
     def _get_attn_projs(self):
@@ -148,7 +196,7 @@ class TransformerBlock(nn.Module):
             AssertionError: If attn_type is not 'mhsa', 'mqa', or 'gqa'.
             ValueError: If n_groups is None when attn_type is 'gqa'.
         """
-        assert self.attn_type in ['mhsa', 'mqa', 'gqa'], f"Invalid attention type: {self.attn_type}. Choose from ['mhsa', 'mqa', 'gqa']"
+        assert self.attn_type in ['mhsa', 'mqa', 'gqa', 'mva', 'tksva'], f"Invalid attention type: {self.attn_type}. Choose from ['mhsa', 'mqa', 'gqa', 'mva', 'tksva']"
         if self.attn_type == 'mhsa':
             linearK = nn.Linear(self.d_model, self.d_model)
             linearV = nn.Linear(self.d_model, self.d_model)              
@@ -164,6 +212,14 @@ class TransformerBlock(nn.Module):
             linearK = nn.Linear(self.d_model, self.d_head * self.n_groups)
             linearV = nn.Linear(self.d_model, self.d_head * self.n_groups) 
             return linearK, linearV 
+        elif self.attn_type == 'mva':
+            linearK = nn.Linear(self.d_model, self.d_head)
+            linearV = nn.Linear(self.d_model, self.d_model)
+            return linearK, linearV
+        elif self.attn_type == 'tksva':
+            linearK = nn.Linear(self.d_model, self.d_head)
+            linearV = nn.Linear(self.d_model, self.d_model)
+            return linearK, linearV
 
     def _reset_cache(self):
         """
@@ -193,8 +249,10 @@ class MultiHeadSelfAttention(nn.Module):
         d_model: int, 
         context_len: int, 
         ntk_rope_scaling: Union[dict, bool], 
-        dyn_scaling: Union[bool, float]
-    ):
+        dyn_scaling: Union[bool, float],
+        flash_attn:bool = False,
+        flash_attn_dtype:torch.dtype = torch.float16
+        ):
         """
         Initializes the MultiHeadSelfAttention module.
 
@@ -205,7 +263,10 @@ class MultiHeadSelfAttention(nn.Module):
             ntk_rope_scaling (Union[dict, bool]): If dict, contains 'pretrained_context_window' and 'new_context_window'
                 for NTK RoPE scaling; if False, no scaling.
             dyn_scaling (Union[bool, float]): If float between 0 and 1, applies dynamic scaling to RoPE; if False, no scaling.
+            flash_attn (bool, optional): If True, uses FlashAttention for faster computation. Defaults to False.
+            flash_attn_dtype (torch.dtype, optional): Data type for FlashAttention. Defaults to torch.float16.            
         """
+
         super().__init__()
         self.n_heads = n_heads 
         self.d_model = d_model
@@ -213,6 +274,10 @@ class MultiHeadSelfAttention(nn.Module):
         self.context_len = context_len
         self.ntk_rope_scaling = ntk_rope_scaling
         self.dyn_scaling = dyn_scaling
+        self.flash_attn = flash_attn
+        self.flash_attn_dtype = flash_attn_dtype
+       
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu' 
         
         self.rope = RotaryPositionalEmbedding(
             d_head=self.d_head,
@@ -234,23 +299,58 @@ class MultiHeadSelfAttention(nn.Module):
         Returns:
             torch.Tensor: Attention output of shape (batch_size, sequence_length, d_model).
         """
-        b, l, d_model = q.shape
+   
+        b, q_l, d_model = q.shape
+        _, k_l, _ = k.shape 
+        _, v_l, _ = v.shape 
+        
         assert d_model == self.d_model, f"Expected d_model to be {self.d_model}, got {d_model}" 
         
         d_head = d_model // self.n_heads
         
-        q = q.view(b, self.n_heads, l, d_head)
-        k = k.view(b, self.n_heads, l, d_head)
-        v = v.view(b, self.n_heads, l, d_head)
+        q = q.view(b, self.n_heads, q_l, d_head)
+        k = k.view(b, self.n_heads, k_l, d_head)
+        v = v.view(b, self.n_heads, v_l, d_head)
 
         q = self.rope(q, _inference=_inference, _q=True)
         k = self.rope(k, _inference=_inference)
 
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / (d_head ** 0.5)
-        causal_mask = torch.tril(torch.ones(attn_logits.shape[-1], attn_logits.shape[-1]), diagonal=1).unsqueeze(0).unsqueeze(0).bool()
-        attn_logits = attn_logits.masked_fill(causal_mask == 0, float("-inf")) 
-        attn_scores = F.softmax(attn_logits, dim=-1)
-        attn_output = torch.matmul(attn_scores, v).view(b, l, d_model)
+        if self.flash_attn:
+            q = q.to(self.flash_attn_dtype)
+            k = k.to(self.flash_attn_dtype)
+            v = v.to(self.flash_attn_dtype) 
+
+        attn_output = F.scaled_dot_product_attention(
+            query = q,
+            key = k,
+            value = v,
+            is_causal = True,
+            enable_gqa = False
+        ).view(b, -1, d_model).to(torch.float32)
+
+        '''
+        if self.flash_attn:
+            
+            q = q.to(self.flash_attn_dtype)
+            k = k.to(self.flash_attn_dtype)
+            v = v.to(self.flash_attn_dtype) 
+            
+            attn_output = F.scaled_dot_product_attention(
+                query = q,
+                key = k,
+                value = v,
+                is_causal = True,
+                enable_gqa = False
+            ).view(b, l, d_model)
+            
+        else:
+            attn_logits = torch.matmul(q, k.transpose(-2, -1)) / (d_head ** 0.5)
+            causal_mask = torch.tril(torch.ones(attn_logits.shape[-1], attn_logits.shape[-1]), diagonal=0).unsqueeze(0).unsqueeze(0).bool().to(self.device)
+            attn_logits = attn_logits.masked_fill(causal_mask == 0, float("-inf")) 
+            attn_scores = F.softmax(attn_logits, dim=-1)
+            attn_output = torch.matmul(attn_scores, v).view(b, l, d_model)
+        '''
+        
         return attn_output
 
 class MultiQueryAttention(nn.Module):
@@ -264,6 +364,7 @@ class MultiQueryAttention(nn.Module):
         context_len (int): Maximum sequence length.
         ntk_rope_scaling (Union[dict, bool]): Configuration for NTK RoPE scaling.
         dyn_scaling (Union[bool, float]): Dynamic scaling factor for RoPE.
+        flash_attn (bool, optional): If True, uses FlashAttention for faster computation. Defaults to False.
     """
     
     def __init__(
@@ -272,8 +373,10 @@ class MultiQueryAttention(nn.Module):
         d_model: int, 
         context_len: int,
         ntk_rope_scaling: Union[dict, bool], 
-        dyn_scaling: Union[bool, float]
-    ):
+        dyn_scaling: Union[bool, float],
+        flash_attn:bool = False,
+        flash_attn_dtype:torch.dtype = torch.float16
+        ):
         """
         Initializes the MultiQueryAttention module.
 
@@ -284,6 +387,8 @@ class MultiQueryAttention(nn.Module):
             ntk_rope_scaling (Union[dict, bool]): If dict, contains 'pretrained_context_window' and 'new_context_window'
                 for NTK RoPE scaling; if False, no scaling.
             dyn_scaling (Union[bool, float]): If float between 0 and 1, applies dynamic scaling to RoPE; if False, no scaling.
+            flash_attn (bool, optional): If True, uses FlashAttention for faster computation. Defaults to False.
+            flash_attn_dtype (torch.dtype, optional): Data type for FlashAttention. Defaults to torch.float16.
         """
         super().__init__()
         self.n_heads = n_heads 
@@ -292,6 +397,10 @@ class MultiQueryAttention(nn.Module):
         self.context_len = context_len
         self.ntk_rope_scaling = ntk_rope_scaling
         self.dyn_scaling = dyn_scaling
+        self.flash_attn = flash_attn
+        self.flash_attn_dtype = flash_attn_dtype
+ 
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
   
         self.rope = RotaryPositionalEmbedding(
             d_head=self.d_head,
@@ -319,20 +428,127 @@ class MultiQueryAttention(nn.Module):
         q = q.view(b, self.n_heads, l, self.d_head)
         k = k.unsqueeze(1)
         v = v.unsqueeze(1) 
-        
-        assert q.shape[2:] == k.shape[2:], f"Expected q and k to match on seq_len and d_head, got {q.shape}, {k.shape}" 
+       
+        if not _inference:
+            assert q.shape[2:] == k.shape[2:], f"Expected q and k to match on seq_len and d_head, got {q.shape}, {k.shape}" 
         assert k.shape == v.shape, f"Expected k and v to have the same shape, got {k.shape}, {v.shape}"
         
         q = self.rope(q, _inference=_inference, _q=True)
         k = self.rope(k, _inference=_inference)
-         
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / (self.d_head ** 0.5) 
-        causal_mask = torch.tril(torch.ones(attn_logits.shape[-1], attn_logits.shape[-1]), diagonal=1).unsqueeze(0).unsqueeze(0).bool()
-        attn_logits = attn_logits.masked_fill(causal_mask == 0, float("-inf"))
-        attn_scores = F.softmax(attn_logits, dim=-1)
-        attn_output = torch.matmul(attn_scores, v).view(b, l, d_model)  
+
+        if self.flash_attn: 
+            # flash attn only works with float16 or bfloat16
+            q = q.to(self.flash_attn_dtype)
+            k = k.to(self.flash_attn_dtype)
+            v = v.to(self.flash_attn_dtype)
+            
+        attn_output = F.scaled_dot_product_attention(
+            query = q,
+            key = k,
+            value = v,
+            is_causal = True,
+            enable_gqa = True
+        ).view(b, l, d_model).to(torch.float32)
+       
+        '''
+        if self.flash_attn: 
+           
+            # flash attn only works with float16 or bfloat16
+            q = q.to(self.flash_attn_dtype)
+            k = k.to(self.flash_attn_dtype)
+            v = v.to(self.flash_attn_dtype)
+            
+            attn_output = F.scaled_dot_product_attention(
+                query = q,
+                key = k,
+                value = v,
+                is_causal = True,
+                enable_gqa = True
+            ).view(b, l, d_model)
+        
+        else: 
+            attn_logits = torch.matmul(q, k.transpose(-2, -1)) / (self.d_head ** 0.5) 
+            causal_mask = torch.tril(torch.ones(attn_logits.shape[-1], attn_logits.shape[-1]), diagonal=0).unsqueeze(0).unsqueeze(0).bool().to(self.device)
+            attn_logits = attn_logits.masked_fill(causal_mask == 0, float("-inf"))
+            attn_scores = F.softmax(attn_logits, dim=-1)
+            attn_output = torch.matmul(attn_scores, v).view(b, l, d_model)  
+        '''
+        
         return attn_output
 
+class MultiValueAttention(nn.Module):
+    def __init__(
+        self,
+        n_heads: int,
+        d_model: int,
+        context_len: int,
+        ntk_rope_scaling: Union[dict, bool],
+        dyn_scaling: Union[bool, float],
+    ):
+        """
+        Initializes the MultiValueAttention module for attention with a single key head.
+
+        Args:
+            n_heads (int): Number of query and value attention heads.
+            d_model (int): Model dimensionality (must be divisible by n_heads).
+            context_len (int): Maximum sequence length.
+            ntk_rope_scaling (Union[dict, bool]): If dict, contains 'pretrained_context_window' and
+                'new_context_window' for NTK scaling; if False, no scaling.
+            dyn_scaling (Union[bool, float]): If float between 0 and 1, applies dynamic scaling; if None or False, no scaling.
+        """
+        super().__init__()
+
+        self.n_heads = n_heads
+        self.d_model = d_model
+        self.d_head = d_model // n_heads
+        self.context_len = context_len
+        self.ntk_rope_scaling = ntk_rope_scaling
+        self.dyn_scaling = dyn_scaling
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.causal_mask = torch.tril(torch.ones(self.context_len, self.context_len), diagonal=0).unsqueeze(0).unsqueeze(0).bool().to(self.device)
+
+        self.rope = RotaryPositionalEmbedding(
+            d_head=self.d_head,
+            context_len=self.context_len,
+            ntk_rope_scaling=self.ntk_rope_scaling,
+            dyn_scaling=self.dyn_scaling
+        )
+
+    def forward(self, q, k, v, _inference=False):
+        """
+        Computes multi-value attention with a single key head and multiple query/value heads.
+
+        Args:
+            q (torch.Tensor): Query tensor of shape (batch_size, sequence_length, d_model).
+            k (torch.Tensor): Key tensor of shape (batch_size, sequence_length, d_head).
+            v (torch.Tensor): Value tensor of shape (batch_size, sequence_length, d_model).
+            _inference (bool, optional): If True, adjusts RoPE for inference mode. Defaults to False.
+
+        Returns:
+            torch.Tensor: Attention output of shape (batch_size, sequence_length, d_model).
+        """
+        b, q_l, d_model = q.shape
+        b, v_l, _ = v.shape 
+        
+        assert d_model == self.d_model, f"Expected d_model to be {self.d_model}, got {d_model}"
+
+        q = q.view(b, self.n_heads, q_l, self.d_head)
+        k = k.unsqueeze(1)
+        v = v.view(b, self.n_heads, v_l, self.d_head)
+
+        if not _inference:
+            assert q.shape[2:] == k.shape[2:], f"Expected q and k to match on seq_len and d_head dims, got {q.shape}, {k.shape}"
+            assert q.shape == v.shape, f"Expected q and v to have the same shape, got {q.shape}, {v.shape}"
+
+        q = self.rope(q, _inference=_inference, _q=True)
+        k = self.rope(k, _inference=_inference)
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / (self.d_head ** 0.5)
+        attn_logits = attn_logits.masked_fill(self.causal_mask[:, :, :q_l, :v_l] == 0, float("-inf"))
+        attn_scores = F.softmax(attn_logits, dim=-1)
+        attn_output = torch.matmul(attn_scores, v).view(b, -1, d_model)
+
+        return attn_output
+        
 class GroupedQueryAttention(nn.Module):
     """
     Implements grouped query attention where heads are grouped, and each group shares keys and values.
@@ -354,7 +570,9 @@ class GroupedQueryAttention(nn.Module):
         d_model: int, 
         context_len: int,
         ntk_rope_scaling: Union[dict, bool], 
-        dyn_scaling: Union[bool, float]        
+        dyn_scaling: Union[bool, float],
+        flash_attn:bool = False,
+        flash_attn_dtype:torch.dtype = torch.float16
     ):
         """
         Initializes the GroupedQueryAttention module.
@@ -367,6 +585,8 @@ class GroupedQueryAttention(nn.Module):
             ntk_rope_scaling (Union[dict, bool]): If dict, contains 'pretrained_context_window' and 'new_context_window'
                 for NTK RoPE scaling; if False, no scaling.
             dyn_scaling (Union[bool, float]): If float between 0 and 1, applies dynamic scaling to RoPE; if False, no scaling.
+            flash_attn (bool, optional): If True, uses FlashAttention for faster computation. Defaults to False.
+            flash_attn_dtype (torch.dtype, optional): Data type for FlashAttention. Defaults to torch.float16.
         """
         super().__init__()
         self.n_heads = n_heads 
@@ -376,6 +596,10 @@ class GroupedQueryAttention(nn.Module):
         self.context_len = context_len
         self.ntk_rope_scaling = ntk_rope_scaling
         self.dyn_scaling = dyn_scaling
+        self.flash_attn = flash_attn
+        self.flash_attn_dtype = flash_attn_dtype
+  
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
    
         self.rope = RotaryPositionalEmbedding(
             d_head=self.d_head,
@@ -404,22 +628,160 @@ class GroupedQueryAttention(nn.Module):
         assert l_k == l_v, f"Expected k and v to have same sequence length, got {l_k}, {l_v}"  
         assert self.n_heads % self.n_groups == 0, f"Expected n_heads divisible by n_groups, got n_heads: {self.n_heads}, n_groups: {self.n_groups}"
         assert d_model == self.d_model, f"Expected d_model to be {self.d_model}, got {d_model}"  
-        
-        repeats = int(self.n_heads / self.n_groups)
+       
         q = q.view(b, self.n_heads, l, self.d_head)
-        k = k.view(b, self.n_groups, l_k, self.d_head).repeat_interleave(repeats=repeats, dim=1)
-        v = v.view(b, self.n_groups, l_v, self.d_head).repeat_interleave(repeats=repeats, dim=1)
+        k = k.view(b, self.n_groups, l_k, self.d_head)
+        v = v.view(b, self.n_groups, l_v, self.d_head)
+      
+        if self.flash_attn:
+            q = self.rope(q, _inference=_inference, _q=True).to(self.flash_attn_dtype)
+            k = self.rope(k, _inference=_inference).to(self.flash_attn_dtype)
+            v = v.to(self.flash_attn_dtype)
+
+        attn_output = F.scaled_dot_product_attention(
+            query = q,
+            key = k,
+            value = v,
+            is_causal = True,
+            enable_gqa = True
+        ).view(b, l, d_model).to(torch.float32)
+ 
+        '''
+        if self.flash_attn:
+            q = self.rope(q, _inference=_inference, _q=True).to(self.flash_attn_dtype)
+            k = self.rope(k, _inference=_inference).to(self.flash_attn_dtype)
+            v = v.to(self.flash_attn_dtype)
+
+            attn_output = F.scaled_dot_product_attention(
+                query = q,
+                key = k,
+                value = v,
+                is_causal = True,
+                enable_gqa = True
+            ).view(b, l, d_model)
         
-        q = self.rope(q, _inference=_inference, _q=True)
-        k = self.rope(k, _inference=_inference) 
-        
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) / (self.d_head ** 0.5) 
-        causal_mask = torch.tril(torch.ones(attn_logits.shape[-1], attn_logits.shape[-1]), diagonal=1).unsqueeze(0).unsqueeze(0).bool()
-        attn_logits = attn_logits.masked_fill(causal_mask == 0, float("-inf"))
-        attn_scores = F.softmax(attn_logits, dim=-1)
-        attn_output = torch.matmul(attn_scores, v).view(b, l, d_model)      
+        else:
+            repeats = int(self.n_heads / self.n_groups)
+            q = self.rope(q)
+            k = self.rope(k.repeat_interleave(repeats=repeats, dim=1), _inference = _inference)
+            v = v.repeat_interleave(repeats = repeats, dim = 1)
+
+            attn_logits = torch.matmul(q, k.transpose(-2, -1)) / (self.d_head ** 0.5) 
+            causal_mask = torch.tril(torch.ones(attn_logits.shape[-1], attn_logits.shape[-1]), diagonal=0).unsqueeze(0).unsqueeze(0).bool().to(self.device)
+            attn_logits = attn_logits.masked_fill(causal_mask == 0, float("-inf"))
+            attn_scores = F.softmax(attn_logits, dim=-1)
+            attn_output = torch.matmul(attn_scores, v).view(b, l, d_model)      
+        '''
         return attn_output 
-  
+
+class TopKSparseVAttention(nn.Module):
+    """
+    An experimental implementation of sparse attention using the Top-K mechanism. KV Cache not Implemented.
+
+    Args:
+        n_heads (int): The number of attention heads.
+        d_model (int): The model dimensionality (must be divisible by n_heads).
+        top_k_sparsev (int): The number of top attention scores to retain per query.
+        context_len (int): The maximum sequence length (context size).
+        ntk_rope_scaling (Union[dict, bool]): If provided as a dictionary, should include
+            'pretrained_context_window' and 'new_context_window' for NTK scaling; 
+            if False, no scaling will be applied.
+        dyn_scaling (Union[bool, float]): If set to a float between 0 and 1, applies
+            dynamic scaling for RoPE. If False, no dynamic scaling is applied.
+        flash_attn (bool, optional): If True, uses flash attention (not yet implemented).
+        flash_attn_dtype (torch.dtype, optional): The data type for flash attention 
+            (defaults to `torch.float16`). Flash attention requires this dtype to work optimally.
+
+    Example:
+        model = TopKSparseVAttention(n_heads=8, d_model=512, top_k_sparsev=8, context_len=1024, ntk_rope_scaling=True, dyn_scaling=0.1)
+        q, k, v = torch.randn(2, 1024, 512), torch.randn(2, 1024, 512), torch.randn(2, 1024, 512)
+        output = model(q, k, v)
+    
+    Note:
+        This implementation is experimental and may undergo significant changes. It is also currently very slow, not recommend for use.
+    """
+    
+    def __init__(
+        self,
+        n_heads: int, 
+        d_model: int, 
+        top_k_sparsev: int,
+        context_len: int, 
+        ntk_rope_scaling: Union[dict, bool], 
+        dyn_scaling: Union[bool, float],
+        flash_attn: bool = False,
+        flash_attn_dtype: torch.dtype = torch.float16        
+    ):
+        super().__init__()
+
+        self.n_heads = n_heads 
+        self.d_model = d_model
+        self.top_k_sparsev = top_k_sparsev
+        self.d_head = d_model // n_heads 
+        self.context_len = context_len
+        self.ntk_rope_scaling = ntk_rope_scaling
+        self.dyn_scaling = dyn_scaling
+        self.flash_attn = flash_attn
+        self.flash_attn_dtype = flash_attn_dtype
+      
+        assert self.top_k_sparsev is not None, 'top_k must not be None' 
+       
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu' 
+        
+        self.rope = RotaryPositionalEmbedding(
+            d_head=self.d_head,
+            context_len=self.context_len,
+            ntk_rope_scaling=self.ntk_rope_scaling,
+            dyn_scaling=self.dyn_scaling
+        )
+
+    def forward(self, q, k, v, _inference=False):
+        """
+        Performs the forward pass of the TopK sparse attention mechanism.
+
+        Args:
+            q (torch.Tensor): Query tensor of shape (batch_size, seq_length, d_model).
+            k (torch.Tensor): Key tensor of shape (batch_size, seq_length, d_model).
+            v (torch.Tensor): Value tensor of shape (batch_size, seq_length, d_model).
+            _inference (bool, optional): If True, adjusts the RoPE for inference mode.
+                Defaults to False.
+
+        Returns:
+            torch.Tensor: The attention output tensor of shape (batch_size, seq_length, d_model).
+        
+        """
+        
+        if _inference:
+            raise NotImplementedError('_inference mode not implemented for TopKSparseVAttention')
+        
+        b, T, d_model = q.shape
+       
+        assert d_model == self.d_model
+        assert q.shape == v.shape
+
+        q = q.view(b, T, self.n_heads, self.d_head).permute(0, 2, 1, 3)  
+        v = v.view(b, T, self.n_heads, self.d_head).permute(0, 2, 1, 3)  
+        k = k.unsqueeze(1)  
+
+        q = self.rope(q, _inference = _inference)
+        k = self.rope(k, _inference = _inference)
+        
+        scale = 1.0 / math.sqrt(self.d_head)
+        idx = torch.arange(T, device=q.device)
+        causal = idx.unsqueeze(0) <= idx.unsqueeze(1) 
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * scale 
+        attn_logits = attn_logits.masked_fill(~causal[None, None], float("-inf"))
+        topk_vals, topk_idx = attn_logits.topk(self.top_k_sparsev, dim=-1) 
+        attn_scores = F.softmax(topk_vals, dim=-1)  
+        B, H, T, k = topk_idx.shape
+        D = self.d_head
+        batch_idx = torch.arange(B, device=q.device).view(B, 1, 1, 1).expand(B, H, T, k)
+        head_idx = torch.arange(H, device=q.device).view(1, H, 1, 1).expand(B, H, T, k)
+        topk_v = v[batch_idx, head_idx, topk_idx] 
+        out = (attn_scores.unsqueeze(-1) * topk_v).sum(dim=3) 
+
+        return out.permute(0, 2, 1, 3).reshape(b, T, d_model)
+ 
 class FeedForwardSwiGLU(nn.Module):
     """
     Implements a feed-forward network with SwiGLU activation.
@@ -431,7 +793,7 @@ class FeedForwardSwiGLU(nn.Module):
         linear_out (nn.Linear): Output linear layer.
     """
     
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, h_dim:int):
         """
         Initializes the FeedForwardSwiGLU module.
 
@@ -439,7 +801,6 @@ class FeedForwardSwiGLU(nn.Module):
             d_model (int): Dimensionality of the input and output features.
         """
         super().__init__()
-        h_dim = int((2/3) * 4 * d_model)
         self.d_model = d_model
         self.swiglu_linear = nn.Linear(d_model, h_dim)
         self.swiglu_gate_linear = nn.Linear(d_model, h_dim)
@@ -513,7 +874,12 @@ class PositionalEmbedding(nn.Module):
         Returns:
             torch.Tensor: Input tensor with positional embeddings added.
         """
-        if not _inference or (_inference and (not hasattr(self, 't') or self.t is None)):
+        
+        if not _inference:
+            x_pe = x + self.positional_embedding[:, :x.size(1), :] 
+            x = self.dropout(x_pe) 
+            return x  
+        if _inference and (not hasattr(self, 't') or self.t is None):
             x_pe = x + self.positional_embedding[:, :x.size(1), :] 
             x = self.dropout(x_pe) 
             self.t = x.size(1)

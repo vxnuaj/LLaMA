@@ -1,5 +1,7 @@
+import torch
 import torch.nn as nn
 import warnings
+
 from llama.blocks import PositionalEmbedding, TransformerBlock
 
 class LLaMA(nn.Module):
@@ -40,7 +42,12 @@ class LLaMA(nn.Module):
         dyn_scaling: bool = False,
         attn_type: str = "gqa",
         n_groups: int = None,
-        supress_warnings: bool = True
+        top_k_sparsev:int = None,
+        p_threshold:int = None,
+        p_threshold_steps_fraction:float = None,
+        flash_attn:bool = False,
+        flash_attn_dtype:torch.dtype = torch.float16,
+        supress_warnings: bool = True,
     ):
         """
         Initializes the SmolLLaMA model.
@@ -60,6 +67,8 @@ class LLaMA(nn.Module):
             attn_type (str, optional): Attention mechanism type ('mhsa', 'mqa', 'gqa'). Defaults to 'gqa'.
             n_groups (int, optional): Number of groups for grouped query attention (required if attn_type is 'gqa'). Defaults to None.
             supress_warnings (bool, optional): If True, suppresses warnings (e.g., for 'rope' with learned). Defaults to True.
+            flash_attn (bool, optional): If True, uses FlashAttention for faster computation. Defaults to False.
+            flash_attn_dtype (torch.dtype, optional): Data type for FlashAttention. Defaults to torch.float16.
 
         Raises:
             ValueError: If pos_emb_type is not 'rope' or 'pe'.
@@ -82,6 +91,11 @@ class LLaMA(nn.Module):
         self.dyn_scaling = dyn_scaling
         self.attn_type = attn_type
         self.n_groups = n_groups
+        self.top_k_sparsev = top_k_sparsev
+        self.p_threshold = p_threshold
+        self.p_threshold_steps_fraction = p_threshold_steps_fraction
+        self.flash_attn = flash_attn
+        self.flash_attn_dtype = flash_attn_dtype
 
         self.embeddings = nn.Embedding(
             num_embeddings=self.vocab_size,
@@ -104,7 +118,12 @@ class LLaMA(nn.Module):
                 ntk_rope_scaling=self.ntk_rope_scaling,
                 dyn_scaling=self.dyn_scaling,
                 attn_type=self.attn_type,
-                n_groups=self.n_groups
+                n_groups=self.n_groups,
+                top_k_sparsev = self.top_k_sparsev,
+                p_threshold = self.p_threshold,
+                p_threshold_steps_fraction = self.p_threshold_steps_fraction,
+                flash_attn = self.flash_attn,
+                flash_attn_dtype = self.flash_attn_dtype
             )
             for _ in range(self.n_blocks)
         ])
