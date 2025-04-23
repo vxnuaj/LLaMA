@@ -1,8 +1,10 @@
 # Implementation of LLaMA-1
 
+> Primariliy made for internal training usage.
+> All docstrings were written by Grok-3, for your convenience (and my time).
+
 Implementation of LLaMA in PyTorch. Supports Multi-Head Self-Attention (MHSA), Multi-Query Attention (MQA), Grouped Query Attention (GQA), Multi Value Attention (MVA), TopK Sparse Value Attention (TKSVA), and (dynamic, NTK-aware)-Rotary/Standard Positional Embeddings.
 
-> All docstrings were written by Grok-3, for your convenience (and my time).
 
 ## Sample Usage
 
